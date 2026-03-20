@@ -13,7 +13,15 @@ dependencies = [
     "transformers==4.51.0",
     "xxhash",
     "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.0/flash_attn-2.8.3%2Bcu128torch2.10-cp312-cp312-linux_x86_64.whl",
+    "flashinfer-python>=0.6.6",
+    "flashinfer-cubin>=0.6.6",
+    # "flashinfer-jit-cache>=0.6.6",
 ]
+
+# [[tool.uv.index]]
+# name = "flashinfer-cu129"
+# url = "https://flashinfer.ai/whl/cu129/"
+# explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
@@ -22,9 +30,10 @@ explicit = true
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
+flashinfer-jit-cache = { index = "flashinfer-cu129" }
 
 [project.urls]
-Homepage="https://github.com/GeeeekExplorer/nano-vllm"
+Homepage = "https://github.com/GeeeekExplorer/nano-vllm"
 
 [build-system]
 requires = ["setuptools>=61"]
