@@ -12,6 +12,8 @@ try:
 except ImportError:
     flashinfer = None
 
+FLASHINFER_WORKSPACE_BYTES = 128 * 1024 * 1024
+
 
 @triton.jit
 def store_kvcache_kernel(
@@ -77,50 +79,172 @@ class Attention(nn.Module):
             return "flashinfer"
         return "flash-attn"
 
-    def _build_seq_kv_from_cache(self, k_cache: torch.Tensor, v_cache: torch.Tensor, block_table: torch.Tensor, seq_len: int):
-        if seq_len == 0:
-            return k_cache[:0], v_cache[:0]
-        block_size = k_cache.size(1)
-        num_blocks = (seq_len + block_size - 1) // block_size
-        block_ids = block_table[:num_blocks].to(torch.long)
-        k = k_cache[block_ids].reshape(-1, self.num_kv_heads, self.head_dim)[:seq_len]
-        v = v_cache[block_ids].reshape(-1, self.num_kv_heads, self.head_dim)[:seq_len]
-        return k, v
+    def _get_flashinfer_runtime(self, context, device: torch.device):
+        runtime = getattr(context, "_flashinfer_runtime", None)
+        if runtime is None:
+            runtime = {}
+            context._flashinfer_runtime = runtime
+        device_key = str(device)
+        if device_key not in runtime:
+            runtime[device_key] = dict(
+                workspace=torch.zeros(
+                    FLASHINFER_WORKSPACE_BYTES,
+                    dtype=torch.uint8,
+                    device=device,
+                ),
+                decode_wrappers={},
+                paged_prefill_wrappers={},
+                ragged_prefill_wrappers={},
+            )
+        return runtime[device_key]
 
-    def _flashinfer_prefill(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, context, k_cache: torch.Tensor, v_cache: torch.Tensor):
-        outputs = []
-        num_seqs = context.cu_seqlens_q.numel() - 1
-        for i in range(num_seqs):
-            q_start, q_end = context.cu_seqlens_q[i].item(), context.cu_seqlens_q[i + 1].item()
-            k_start, k_end = context.cu_seqlens_k[i].item(), context.cu_seqlens_k[i + 1].item()
-            q_i = q[q_start:q_end]
-            if context.block_tables is None:
-                k_i = k[k_start:k_end]
-                v_i = v[k_start:k_end]
-            else:
-                k_i, v_i = self._build_seq_kv_from_cache(k_cache, v_cache, context.block_tables[i], k_end - k_start)
-            o_i = flashinfer.prefill.single_prefill_with_kv_cache(
-                q_i,
-                k_i,
-                v_i,
+    def _seq_lens_from_cu_seqlens(self, cu_seqlens: torch.Tensor) -> torch.Tensor:
+        return cu_seqlens[1:] - cu_seqlens[:-1]
+
+    def _build_paged_kv_metadata(self, block_tables: torch.Tensor, seq_lens: torch.Tensor, block_size: int):
+        batch_size = seq_lens.numel()
+        seq_lens_list = seq_lens.tolist()
+        indptr = [0]
+        page_indices = []
+        last_page_len = []
+
+        for i, seq_len in enumerate(seq_lens_list):
+            if seq_len <= 0:
+                indptr.append(indptr[-1])
+                last_page_len.append(0)
+                continue
+            num_blocks = (seq_len + block_size - 1) // block_size
+            indptr.append(indptr[-1] + num_blocks)
+            last_page_len.append((seq_len - 1) % block_size + 1)
+            if num_blocks:
+                page_indices.append(block_tables[i, :num_blocks])
+
+        indices = (
+            torch.cat(page_indices, dim=0)
+            if page_indices
+            else torch.empty(0, dtype=block_tables.dtype, device=block_tables.device)
+        )
+        return (
+            torch.tensor(indptr, dtype=torch.int32, device=block_tables.device),
+            indices.to(dtype=torch.int32),
+            torch.tensor(last_page_len, dtype=torch.int32, device=block_tables.device).view(batch_size),
+        )
+
+    def _get_flashinfer_ragged_prefill_wrapper(self, q: torch.Tensor, k: torch.Tensor, context):
+        runtime = self._get_flashinfer_runtime(context, q.device)
+        key = (self.num_heads, self.num_kv_heads, self.head_dim, self.scale, q.dtype, k.dtype)
+        wrapper = runtime["ragged_prefill_wrappers"].get(key)
+        if wrapper is None:
+            wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+                runtime["workspace"],
+                kv_layout="NHD",
+            )
+            wrapper.plan(
+                context.cu_seqlens_q,
+                context.cu_seqlens_k,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
                 causal=True,
                 sm_scale=self.scale,
+                q_data_type=q.dtype,
+                kv_data_type=k.dtype,
+                seq_lens=self._seq_lens_from_cu_seqlens(context.cu_seqlens_k),
+                seq_lens_q=self._seq_lens_from_cu_seqlens(context.cu_seqlens_q),
             )
-            outputs.append(o_i)
-        return torch.cat(outputs, dim=0)
+            runtime["ragged_prefill_wrappers"][key] = wrapper
+        return wrapper
+
+    def _get_flashinfer_paged_prefill_wrapper(self, q: torch.Tensor, k_cache: torch.Tensor, context):
+        runtime = self._get_flashinfer_runtime(context, q.device)
+        block_size = k_cache.size(1)
+        key = (self.num_heads, self.num_kv_heads, self.head_dim, self.scale, q.dtype, k_cache.dtype, block_size)
+        wrapper = runtime["paged_prefill_wrappers"].get(key)
+        if wrapper is None:
+            seq_lens = self._seq_lens_from_cu_seqlens(context.cu_seqlens_k)
+            seq_lens_q = self._seq_lens_from_cu_seqlens(context.cu_seqlens_q)
+            kv_indptr, kv_indices, kv_last_page_len = self._build_paged_kv_metadata(
+                context.block_tables,
+                seq_lens,
+                block_size,
+            )
+            wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+                runtime["workspace"],
+                kv_layout="NHD",
+            )
+            wrapper.plan(
+                context.cu_seqlens_q,
+                kv_indptr,
+                kv_indices,
+                kv_last_page_len,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                block_size,
+                causal=True,
+                sm_scale=self.scale,
+                q_data_type=q.dtype,
+                kv_data_type=k_cache.dtype,
+                seq_lens=seq_lens,
+                seq_lens_q=seq_lens_q,
+                block_tables=context.block_tables,
+            )
+            runtime["paged_prefill_wrappers"][key] = wrapper
+        return wrapper
+
+    def _get_flashinfer_decode_wrapper(self, q: torch.Tensor, k_cache: torch.Tensor, context):
+        runtime = self._get_flashinfer_runtime(context, q.device)
+        block_size = k_cache.size(1)
+        use_tensor_cores = self.num_heads != self.num_kv_heads
+        key = (
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.scale,
+            q.dtype,
+            k_cache.dtype,
+            block_size,
+            use_tensor_cores,
+        )
+        wrapper = runtime["decode_wrappers"].get(key)
+        if wrapper is None:
+            kv_indptr, kv_indices, kv_last_page_len = self._build_paged_kv_metadata(
+                context.block_tables,
+                context.context_lens,
+                block_size,
+            )
+            wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+                runtime["workspace"],
+                kv_layout="NHD",
+                use_tensor_cores=use_tensor_cores,
+            )
+            wrapper.plan(
+                kv_indptr,
+                kv_indices,
+                kv_last_page_len,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                block_size,
+                sm_scale=self.scale,
+                q_data_type=q.dtype,
+                kv_data_type=k_cache.dtype,
+                block_tables=context.block_tables,
+                seq_lens=context.context_lens,
+            )
+            runtime["decode_wrappers"][key] = wrapper
+        return wrapper
+
+    def _flashinfer_prefill(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, context, k_cache: torch.Tensor, v_cache: torch.Tensor):
+        if context.block_tables is None:
+            wrapper = self._get_flashinfer_ragged_prefill_wrapper(q, k, context)
+            return wrapper.run(q, k, v)
+        wrapper = self._get_flashinfer_paged_prefill_wrapper(q, k_cache, context)
+        return wrapper.run(q, (k_cache, v_cache))
 
     def _flashinfer_decode(self, q: torch.Tensor, context, k_cache: torch.Tensor, v_cache: torch.Tensor):
-        outputs = []
-        for i, seq_len in enumerate(context.context_lens.tolist()):
-            k_i, v_i = self._build_seq_kv_from_cache(k_cache, v_cache, context.block_tables[i], seq_len)
-            o_i = flashinfer.decode.single_decode_with_kv_cache(
-                q[i],
-                k_i,
-                v_i,
-                sm_scale=self.scale,
-            )
-            outputs.append(o_i)
-        return torch.stack(outputs, dim=0)
+        wrapper = self._get_flashinfer_decode_wrapper(q, k_cache, context)
+        return wrapper.run(q, (k_cache, v_cache))
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()

@@ -67,6 +67,67 @@ class TestAttentionBackendConsistency(unittest.TestCase):
 
         torch.testing.assert_close(out_flashinfer, out_flash_attn, rtol=self.rtol, atol=self.atol)
 
+    def test_prefill_with_prefix_cache_outputs_are_identical(self):
+        total_seqlens = [300, 385]
+        cached_seqlens = [256, 320]
+        query_seqlens = [total - cached for total, cached in zip(total_seqlens, cached_seqlens)]
+        total_query_tokens = sum(query_seqlens)
+
+        q = torch.randn(total_query_tokens, self.num_heads, self.head_dim, device=self.device, dtype=self.dtype)
+
+        k_prefix_0 = torch.randn(cached_seqlens[0], self.num_kv_heads, self.head_dim, device=self.device, dtype=self.dtype)
+        v_prefix_0 = torch.randn_like(k_prefix_0)
+        k_new_0 = torch.randn(query_seqlens[0], self.num_kv_heads, self.head_dim, device=self.device, dtype=self.dtype)
+        v_new_0 = torch.randn_like(k_new_0)
+
+        k_prefix_1 = torch.randn(cached_seqlens[1], self.num_kv_heads, self.head_dim, device=self.device, dtype=self.dtype)
+        v_prefix_1 = torch.randn_like(k_prefix_1)
+        k_new_1 = torch.randn(query_seqlens[1], self.num_kv_heads, self.head_dim, device=self.device, dtype=self.dtype)
+        v_new_1 = torch.randn_like(k_new_1)
+
+        k = torch.cat([k_new_0, k_new_1], dim=0)
+        v = torch.cat([v_new_0, v_new_1], dim=0)
+
+        block_size = 256
+        num_blocks = 4
+        block_tables = torch.tensor([[0, 3], [1, 2]], dtype=torch.int32, device=self.device)
+        k_cache = torch.zeros(num_blocks, block_size, self.num_kv_heads, self.head_dim, device=self.device, dtype=self.dtype)
+        v_cache = torch.zeros_like(k_cache)
+
+        k_cache[0, :cached_seqlens[0]] = k_prefix_0
+        v_cache[0, :cached_seqlens[0]] = v_prefix_0
+        k_cache[1] = k_prefix_1[:block_size]
+        v_cache[1] = v_prefix_1[:block_size]
+        k_cache[2, :cached_seqlens[1] - block_size] = k_prefix_1[block_size:]
+        v_cache[2, :cached_seqlens[1] - block_size] = v_prefix_1[block_size:]
+
+        cu_seqlens_q = torch.tensor([0, query_seqlens[0], total_query_tokens], dtype=torch.int32, device=self.device)
+        cu_seqlens_k = torch.tensor([0, total_seqlens[0], sum(total_seqlens)], dtype=torch.int32, device=self.device)
+        slot_mapping = torch.tensor(
+            list(range(block_tables[0, 1].item() * block_size, block_tables[0, 1].item() * block_size + query_seqlens[0])) +
+            list(range(block_tables[1, 1].item() * block_size + (cached_seqlens[1] - block_size), block_tables[1, 1].item() * block_size + (cached_seqlens[1] - block_size) + query_seqlens[1])),
+            dtype=torch.int64,
+            device=self.device,
+        )
+
+        set_context(
+            True,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max(query_seqlens),
+            max_seqlen_k=max(total_seqlens),
+            slot_mapping=slot_mapping,
+            block_tables=block_tables,
+        )
+
+        attn_flash_attn = self._new_attention("flash-attn", k_cache.clone(), v_cache.clone())
+        attn_flashinfer = self._new_attention("flashinfer", k_cache.clone(), v_cache.clone())
+
+        out_flash_attn = attn_flash_attn(q, k, v)
+        out_flashinfer = attn_flashinfer(q, k, v)
+
+        torch.testing.assert_close(out_flashinfer, out_flash_attn, rtol=self.rtol, atol=self.atol)
+
     def test_decode_outputs_are_identical(self):
         # Two sequences: len=257 with block table [0, 3], len=384 with block table [1, 2]
         # flash-attn paged KV requires block_size to be divisible by 256.
