@@ -1,6 +1,7 @@
 import os
 import time
 import unittest
+import statistics
 
 import torch
 
@@ -13,6 +14,7 @@ from nanovllm.utils.context import reset_context, set_context
 class TestAttentionBackendThroughput(unittest.TestCase):
     warmup_iters = 10
     measure_iters = 50
+    benchmark_rounds = 5
 
     def setUp(self):
         torch.manual_seed(0)
@@ -33,20 +35,35 @@ class TestAttentionBackendThroughput(unittest.TestCase):
         attn.v_cache = v_cache
         return attn
 
-    def _benchmark(self, fn, total_tokens: int) -> tuple[float, float]:
-        for _ in range(self.warmup_iters):
-            fn()
-        torch.cuda.synchronize()
+    def _benchmark(self, fn, total_tokens: int) -> tuple[float, float, float, float]:
+        latencies_ms = []
+        throughputs_tok_s = []
 
-        start = time.perf_counter()
-        for _ in range(self.measure_iters):
-            fn()
-        torch.cuda.synchronize()
-        elapsed_s = time.perf_counter() - start
+        for round_idx in range(self.benchmark_rounds):
+            for _ in range(self.warmup_iters):
+                fn()
+            torch.cuda.synchronize()
 
-        avg_latency_ms = elapsed_s * 1000 / self.measure_iters
-        throughput_tok_s = total_tokens * self.measure_iters / elapsed_s
-        return avg_latency_ms, throughput_tok_s
+            start = time.perf_counter()
+            for _ in range(self.measure_iters):
+                fn()
+            torch.cuda.synchronize()
+
+            elapsed_s = time.perf_counter() - start
+
+            latency_ms = elapsed_s * 1000 / self.measure_iters
+            throughput_tok_s = total_tokens * self.measure_iters / elapsed_s
+
+            latencies_ms.append(latency_ms)
+            throughputs_tok_s.append(throughput_tok_s)
+
+        avg_latency_ms = statistics.mean(latencies_ms)
+        avg_throughput_tok_s = statistics.mean(throughputs_tok_s)
+
+        std_latency_ms = statistics.stdev(latencies_ms) if len(latencies_ms) > 1 else 0.0
+        std_throughput_tok_s = statistics.stdev(throughputs_tok_s) if len(throughputs_tok_s) > 1 else 0.0
+
+        return avg_latency_ms, avg_throughput_tok_s, std_latency_ms, std_throughput_tok_s
 
     def test_prefill_throughput(self):
         seqlens = [128, 96]
@@ -61,7 +78,14 @@ class TestAttentionBackendThroughput(unittest.TestCase):
 
         block_size = 256
         num_blocks = 4
-        k_cache = torch.zeros(num_blocks, block_size, self.num_kv_heads, self.head_dim, device=self.device, dtype=self.dtype)
+        k_cache = torch.zeros(
+            num_blocks,
+            block_size,
+            self.num_kv_heads,
+            self.head_dim,
+            device=self.device,
+            dtype=self.dtype,
+        )
         v_cache = torch.zeros_like(k_cache)
 
         set_context(
@@ -76,11 +100,18 @@ class TestAttentionBackendThroughput(unittest.TestCase):
 
         for backend in ("flash-attn", "flashinfer"):
             attn = self._new_attention(backend, k_cache.clone(), v_cache.clone())
-            latency_ms, throughput_tok_s = self._benchmark(lambda: attn(q, k, v), total_tokens)
+
+            avg_latency_ms, avg_throughput_tok_s, std_latency_ms, std_throughput_tok_s = self._benchmark(
+                lambda: attn(q, k, v),
+                total_tokens,
+            )
+
             print(
                 f"\nprefill backend={backend} "
-                f"latency_ms={latency_ms:.3f} "
-                f"throughput_tok_s={throughput_tok_s:.2f}"
+                f"rounds={self.benchmark_rounds} "
+                f"measure_iters={self.measure_iters} "
+                f"latency_ms={avg_latency_ms:.3f}±{std_latency_ms:.3f} "
+                f"throughput_tok_s={avg_throughput_tok_s:.2f}±{std_throughput_tok_s:.2f}"
             )
 
     def test_decode_throughput(self):
@@ -94,7 +125,14 @@ class TestAttentionBackendThroughput(unittest.TestCase):
 
         block_size = 256
         num_blocks = 4
-        k_cache = torch.randn(num_blocks, block_size, self.num_kv_heads, self.head_dim, device=self.device, dtype=self.dtype)
+        k_cache = torch.randn(
+            num_blocks,
+            block_size,
+            self.num_kv_heads,
+            self.head_dim,
+            device=self.device,
+            dtype=self.dtype,
+        )
         v_cache = torch.randn_like(k_cache)
 
         set_context(
@@ -106,11 +144,18 @@ class TestAttentionBackendThroughput(unittest.TestCase):
 
         for backend in ("flash-attn", "flashinfer"):
             attn = self._new_attention(backend, k_cache.clone(), v_cache.clone())
-            latency_ms, throughput_tok_s = self._benchmark(lambda: attn(q, k, v), q.size(0))
+
+            avg_latency_ms, avg_throughput_tok_s, std_latency_ms, std_throughput_tok_s = self._benchmark(
+                lambda: attn(q, k, v),
+                q.size(0),
+            )
+
             print(
                 f"\ndecode backend={backend} "
-                f"latency_ms={latency_ms:.3f} "
-                f"throughput_tok_s={throughput_tok_s:.2f}"
+                f"rounds={self.benchmark_rounds} "
+                f"measure_iters={self.measure_iters} "
+                f"latency_ms={avg_latency_ms:.3f}±{std_latency_ms:.3f} "
+                f"throughput_tok_s={avg_throughput_tok_s:.2f}±{std_throughput_tok_s:.2f}"
             )
 
 
