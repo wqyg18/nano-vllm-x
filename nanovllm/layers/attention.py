@@ -66,6 +66,7 @@ class Attention(nn.Module):
         requested_backend = os.getenv("NANOVLLM_ATTENTION_BACKEND", "auto")
         self.backend = self._resolve_backend(requested_backend)
 
+    # 在启动服务时, 指定backend
     def _resolve_backend(self, requested_backend: str) -> str:
         if requested_backend not in ("auto", "flash-attn", "flashinfer"):
             raise ValueError(f"Unsupported attention backend: {requested_backend}")
@@ -79,6 +80,7 @@ class Attention(nn.Module):
             return "flashinfer"
         return "flash-attn"
 
+    # 为不同的Context, device维护一个runtime, 这样不用多次初始化wapper
     def _get_flashinfer_runtime(self, context, device: torch.device):
         runtime = getattr(context, "_flashinfer_runtime", None)
         if runtime is None:
@@ -98,10 +100,24 @@ class Attention(nn.Module):
             )
         return runtime[device_key]
 
+    # 计算出每一个seq的seqlen
     def _seq_lens_from_cu_seqlens(self, cu_seqlens: torch.Tensor) -> torch.Tensor:
+        # [0,2,5,9]
+        # [2,5,9] - [0,2,5] = [2,3,4]
         return cu_seqlens[1:] - cu_seqlens[:-1]
 
+    # flash-attn中直接传递的cu_seqlens, 这里由于flashinfer需要的是qo_indptr,paged_kv_indptr,paged_kv_indices,paged_kv_last_page_len
+    """
+    qo_indptr: 每个 request 的 query/output token 在压平后的 q/o tensor 中的起止位置, 其实和cu_seqlens_q是一模一样的, 所以大小是[batch_size + 1], 注意第一项是0
+    paged_kv_indptr: 记录了每一个request的kv对应哪几个block, 同样大小是[batch_size + 1]
+    paged_kv_indices: 用于paged_kv_indptr, paged_kv_indices中存放具体的block_id, paged_kv_indptr指明第几个到第几个属于第几个request, 大小显然是[paged_kv_indptr[-1]]
+    paged_kv_last_page_len: 因为最后一个 page 通常不会刚好填满，所以需要它告诉 kernel: 每个请求最后一个 page 里有多少个有效 token(每一个seq当然都有一个), 因为没有第一个0, 所以大小是[batch_size]
+    """
     def _build_paged_kv_metadata(self, block_tables: torch.Tensor, seq_lens: torch.Tensor, block_size: int):
+        """
+        block_tables: [batch_size, max_blocks_per_sequence]
+        return: kv_indptr, kv_indices, kv_last_page_len
+        """
         batch_size = seq_lens.numel()
         seq_lens_list = seq_lens.tolist()
         indptr = [0]
@@ -109,14 +125,19 @@ class Attention(nn.Module):
         last_page_len = []
 
         for i, seq_len in enumerate(seq_lens_list):
+            # 空请求
             if seq_len <= 0:
                 indptr.append(indptr[-1])
                 last_page_len.append(0)
                 continue
-            num_blocks = (seq_len + block_size - 1) // block_size
+            # kv_indptr是block级的cu_len
+            num_blocks = (seq_len + block_size - 1) // block_size # 首先seq_len>=1, 那么这样运算保证了至少占用1个block
             indptr.append(indptr[-1] + num_blocks)
+            # 这里之所以先-1再+1, 是为了让block满这个状态对应的结果是block_size, 而不是0
             last_page_len.append((seq_len - 1) % block_size + 1)
             if num_blocks:
+                # 这里这样取是因为, 现在seq的block_table已经分配好了, 之所以不直接用block_tables[i], 是因为初始化的时候(model_runner中的prepare_block_tables)
+                # block_table初始化为[-1] * max_blocks_per_sequence
                 page_indices.append(block_tables[i, :num_blocks])
 
         indices = (
